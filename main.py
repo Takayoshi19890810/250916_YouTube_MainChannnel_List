@@ -1,323 +1,313 @@
-# -*- coding: utf-8 -*-
+# main.py
+
 import os
 import re
-import io
-import time
-from datetime import datetime, timezone, timedelta
-
-import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+# ==== 設定 ====
+API_KEY = os.environ.get("YOUTUBE_API_KEY")  # GitHub Actions Secrets から供給
+EXCEL_FILE = "youtube_videos.xlsx"
+YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/"
 
-# ===== 設定 =====
-RELEASE_TAG = "news-latest"
-ASSET_NAME = "yahoo_news.xlsx"
-SHEET_NAMES = [
-    "ホンダ",
-    "トヨタ",
-    "マツダ",
-    "スバル",
-    "ダイハツ",
-    "スズキ",
-    "三菱自動車",
-    "日産",  # 任意で追加
+# 監視対象チャンネル（名前, チャンネルID）
+CHANNEL_DATA = [
+    ["ワンソクTube", "UCo150kMjyLQDsLdudoyCqYg"],
+    ["e-Carlife", "UCacmUS5IWcTzpI3b4ZkkSgw"],
+    ["Lavecars TV", "UCtLo4nwb3ObCDZ4m8b8u7fA"],
+    ["Driver channel", "UCup9EloQKxgDKvgJeKKZ85Q"],
+    ["ベストカーweb", "UC7yk5_U7C0TuvYMqWzKyzkQ"],
+    ["Ride now", "UC0P8fXzj-JxUsvDFEbpAkSg"],
+    ["Kozzi TV", "UCaN_F80VfpzDN-vKn3IF4IQ"],  # 修正済み
 ]
 
-# 既定は上のリスト。環境変数 NEWS_KEYWORDS に「ホンダ,トヨタ,…」と入れたら上書き可能
-def get_keywords() -> list[str]:
-    env = os.getenv("NEWS_KEYWORDS")
-    if env:
-        # カンマ区切り or 改行で分割
-        parts = [p.strip() for p in re.split(r"[,\n]", env) if p.strip()]
-        return parts or SHEET_NAMES
-    return SHEET_NAMES
+# 取得対象期間（例：直近60日）
+CUTOFF_DAYS = 60
+# ショート等の除外（60秒未満は除外）
+MIN_DURATION_SEC = 60
 
 
-# ===== ユーティリティ =====
-def jst_now():
-    return datetime.now(timezone(timedelta(hours=9)))
+# ==== ユーティリティ ====
+def parse_iso_duration(iso_duration: str) -> int:
+    """ISO8601のPTxxHxxMxxSを秒に変換"""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_duration or "")
+    if not m:
+        return 0
+    h, mm, s = m.groups(default="0")
+    return int(h) * 3600 + int(mm) * 60 + int(s)
 
 
-def jst_str(fmt="%Y/%m/%d %H:%M"):
-    return jst_now().strftime(fmt)
+def format_duration(seconds: int) -> str:
+    """秒→HH:MM:SS"""
+    h, s = divmod(int(seconds), 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-# ===== Chrome（headless） =====
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    chrome_path = os.getenv("CHROME_PATH")  # Actionsで注入
-    if chrome_path:
-        opts.binary_location = chrome_path
-    opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--window-size=1280,2000")
-    # 長期運用時の出し分け対策：UA固定でも良いが、古すぎると要素出し分けが起きる場合あり
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-
-
-# ===== 引用元のクリーンアップ =====
-DATE_RE = re.compile(r"(?:\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2})\s*\d{1,2}[:：]\d{2}")
-
-
-def clean_source_text(text: str) -> str:
-    if not text:
+def calculate_engagement(views, likes, comments) -> str:
+    """(いいね+コメント)/再生数 * 100 [%]"""
+    try:
+        v = int(views)
+        l = int(likes)
+        c = int(comments)
+    except Exception:
         return ""
-    t = text
-    t = re.sub(r"[（(][^）)]+[）)]", "", t)      # （）内を削除
-    t = DATE_RE.sub("", t)                       # 日付+時刻パターンを削除
-    t = re.sub(r"^\d+\s*", "", t)                # 先頭の通し番号（例: "2 Merkmal"）
-    t = re.sub(r"\s{2,}", " ", t).strip()        # 余分な空白整理
-    return t
+    if v <= 0:
+        return ""
+    return f"{((l + c) / v) * 100:.2f}%"
 
 
-# ===== Yahoo!ニュース検索（1ページ分） =====
-def scrape_yahoo(keyword: str) -> pd.DataFrame:
+# ==== YouTube Data API ====
+def get_uploads_playlist_id(channel_id: str) -> str | None:
+    """チャンネルID→uploadsプレイリストID"""
+    try:
+        resp = requests.get(
+            f"{YOUTUBE_API_URL}channels",
+            params={"part": "contentDetails", "id": channel_id, "key": API_KEY},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            print(f"❌ チャンネルID '{channel_id}' が見つかりません")
+            return None
+        return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    except Exception as e:
+        print(f"❌ チャンネル情報取得エラー: {e}")
+        return None
+
+
+def get_videos_from_playlist(playlist_id: str, cutoff_date: datetime) -> list[dict]:
     """
-    指定キーワードでYahoo!ニュース（検索）から タイトル/URL/投稿日/引用元 を取得（1ページ）
+    uploadsプレイリストから動画の基礎情報を取得。
+    cutoff_date より古い動画に達したら打ち切る。
     """
-    driver = make_driver()
-    url = (
-        f"https://news.yahoo.co.jp/search?p={keyword}"
-        f"&ei=utf-8&categories=domestic,world,business,it,science,life,local"
-    )
-    driver.get(url)
-    time.sleep(5)  # 初期描画待ち
+    results: list[dict] = []
+    if not playlist_id:
+        return results
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    driver.quit()
-
-    # li のクラスは変動しやすいので正規表現で拾う
-    items = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
-    rows = []
-    for li in items:
+    page_token = None
+    while True:
         try:
-            title_tag = li.find("div", class_=re.compile("sc-3ls169-0"))
-            link_tag = li.find("a", href=True)
-            time_tag = li.find("time")
+            params = {
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": 50,
+                "key": API_KEY,
+            }
+            if page_token:
+                params["pageToken"] = page_token
 
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            url = link_tag["href"] if link_tag else ""
-            date_str = time_tag.get_text(strip=True) if time_tag else ""
+            resp = requests.get(f"{YOUTUBE_API_URL}playlistItems", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
 
-            # 投稿日：フォーマットできれば "9/26 16:19" に正規化
-            pub_date = "取得不可"
-            if date_str:
-                ds = re.sub(r'\([月火水木金土日]\)', '', date_str).strip()
-                try:
-                    # 入力フォーマットが「2024/09/26 16:19」の場合
-                    dt = datetime.strptime(ds, "%Y/%m/%d %H:%M")
-                    pub_date = dt.strftime("%-m/%-d %H:%M")
-                except ValueError:
-                    try:
-                        # 入力フォーマットが「9/26 16:19」の場合
-                        dt = datetime.strptime(ds, "%m/%d %H:%M")
-                        pub_date = dt.strftime("%-m/%-d %H:%M")
-                    except Exception:
-                        # どちらにも当てはまらない場合、元の文字列をそのまま使用
-                        pub_date = ds
-
-            # 引用元（媒体＋カテゴリなど）を抽出してクリーン
-            source = ""
-            for sel in [
-                "div.sc-n3vj8g-0.yoLqH div.sc-110wjhy-8.bsEjY span",
-                "div.sc-n3vj8g-0.yoLqH",
-                "span",
-                "div",
-            ]:
-                el = li.select_one(sel)
-                if not el:
+            for item in data.get("items", []):
+                snippet = item.get("snippet") or {}
+                published_at_str = snippet.get("publishedAt")
+                if not published_at_str:
                     continue
-                raw = el.get_text(" ", strip=True)
-                txt = clean_source_text(raw)
-                if txt and not txt.isdigit():
-                    source = txt
-                    break
 
-            if title and url:
-                rows.append(
+                # 例: '2025-09-01T12:34:56Z' → datetime
+                published_at = datetime.fromisoformat(published_at_str.rstrip("Z"))
+                if published_at < cutoff_date:
+                    # 以降は古いと仮定して打ち切り
+                    return results
+
+                results.append(
                     {
-                        "タイトル": title,
-                        "URL": url,
-                        "投稿日": pub_date,
-                        "引用元": source or "Yahoo",
-                        "取得日時": jst_str(),       # 追記運用のため取得時刻も保持
-                        "検索キーワード": keyword,   # 念のため列としても持っておく
+                        "title": snippet.get("title", "タイトルなし"),
+                        "videoId": (snippet.get("resourceId") or {}).get("videoId"),
+                        "publishedAt": published_at_str,  # ISO文字列のまま保持
                     }
                 )
+
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+        except Exception as e:
+            print(f"❌ プレイリスト取得エラー: {e}")
+            break
+
+    return results
+
+
+def get_video_details(video_ids: list[str]) -> dict[str, dict]:
+    """動画ID群→ {videoId: {viewCount, likeCount, commentCount, durationSeconds}}"""
+    details: dict[str, dict] = {}
+    if not video_ids:
+        return details
+
+    for i in range(0, len(video_ids), 50):
+        ids_chunk = list(filter(None, video_ids[i : i + 50]))
+        if not ids_chunk:
+            continue
+        try:
+            resp = requests.get(
+                f"{YOUTUBE_API_URL}videos",
+                params={
+                    "part": "statistics,contentDetails",
+                    "id": ",".join(ids_chunk),
+                    "key": API_KEY,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get("items", []):
+                vid = item.get("id")
+                stats = item.get("statistics", {}) or {}
+                dur_iso = (item.get("contentDetails", {}) or {}).get("duration", "PT0S")
+                details[vid] = {
+                    "viewCount": stats.get("viewCount", 0),
+                    "likeCount": stats.get("likeCount", 0),
+                    "commentCount": stats.get("commentCount", 0),
+                    "durationSeconds": parse_iso_duration(dur_iso),
+                }
+        except Exception as e:
+            print(f"❌ 動画詳細取得エラー: {e}")
+
+    return details
+
+
+# ==== Excelの結合（既存ベースで新規だけ追記） ====
+def append_to_excel_base_on_existing(base_xlsx: str, new_rows: pd.DataFrame) -> None:
+    """
+    既存Excelの内容をベースに new_rows を追記し、動画IDで重複排除して保存。
+    公開日時があれば降順に並べ替え。
+    """
+    base_path = Path(base_xlsx)
+
+    if base_path.exists():
+        try:
+            base_df = pd.read_excel(base_path)
         except Exception:
+            base_df = pd.DataFrame()
+    else:
+        base_df = pd.DataFrame()
+
+    # 列合わせ（欠けている列を補完）
+    for col in set(new_rows.columns) - set(base_df.columns):
+        base_df[col] = pd.NA
+    for col in set(base_df.columns) - set(new_rows.columns):
+        new_rows[col] = pd.NA
+
+    merged = pd.concat([new_rows, base_df], ignore_index=True)  # 新着を先頭に
+    if "動画ID" in merged.columns:
+        merged.drop_duplicates(subset=["動画ID"], keep="first", inplace=True)
+
+    # 公開日時の列候補
+    for cand in ["投稿日", "publishedAt", "publishTime", "published_at"]:
+        if cand in merged.columns:
+            merged[cand] = pd.to_datetime(merged[cand], errors="coerce")
+            merged.sort_values(cand, ascending=False, inplace=True)
+            break
+
+    merged.reset_index(drop=True, inplace=True)
+    merged.to_excel(base_path, index=False)
+
+
+# ==== メイン ====
+def main():
+    if not API_KEY:
+        print("エラー: YouTube APIキーが設定されていません。")
+        return
+
+    # 既存Excelから既知の動画ID集合を作る（なければ空）
+    try:
+        df_existing = pd.read_excel(EXCEL_FILE)
+        known_ids = set(df_existing.get("動画ID", pd.Series(dtype=str)).dropna().astype(str).tolist())
+        print(f"既存Excel '{EXCEL_FILE}' を読み込みました。既知ID: {len(known_ids)}件")
+    except FileNotFoundError:
+        df_existing = pd.DataFrame(
+            columns=[
+                "チャンネル名",
+                "タイトル",
+                "投稿日",
+                "動画ID",
+                "再生時間",
+                "再生数",
+                "コメント数",
+                "イイネ数",
+                "エンゲージメント係数",
+                "URL",
+            ]
+        )
+        known_ids = set()
+        print(f"'{EXCEL_FILE}' が見つからないため、新規作成します。")
+    except Exception as e:
+        print(f"Excel読み込みエラー: {e}")
+        return
+
+    cutoff = datetime.now() - timedelta(days=CUTOFF_DAYS)
+    new_records = []
+
+    for channel_name, channel_id in CHANNEL_DATA:
+        print(f"▶ 処理中: {channel_name} ({channel_id})")
+        uploads_id = get_uploads_playlist_id(channel_id)
+        if not uploads_id:
             continue
 
-    return pd.DataFrame(rows, columns=["タイトル", "URL", "投稿日", "引用元", "取得日時", "検索キーワード"])
+        videos = get_videos_from_playlist(uploads_id, cutoff)
+        if not videos:
+            print(f"チャンネル '{channel_name}' に新着はありません。")
+            continue
 
+        ids = [v["videoId"] for v in videos if v.get("videoId")]
+        details = get_video_details(ids)
 
-# ===== Releaseから既存Excelを取得（全シート） =====
-def download_existing_book(repo: str, tag: str, asset_name: str, token: str) -> dict[str, pd.DataFrame]:
-    """
-    Release(tag)の既存Excel全シートを読み出して {sheet_name: df} で返す。
-    見つからなければ、指定シート名それぞれ空DFで返す。
-    """
-    # 初期値（指定の全シート分、空DF）
-    empty_cols = ["タイトル", "URL", "投稿日", "引用元", "取得日時", "検索キーワード"]
-    dfs: dict[str, pd.DataFrame] = {sn: pd.DataFrame(columns=empty_cols) for sn in SHEET_NAMES}
+        for v in videos:
+            vid = v.get("videoId")
+            if not vid or vid in known_ids:
+                continue
 
-    if not (repo and tag):
-        print("⚠️ download_existing_book: repo/tag が未設定のためスキップ")
-        return dfs
+            det = details.get(vid, {})
+            dur = int(det.get("durationSeconds") or 0)
+            if dur < MIN_DURATION_SEC:
+                # 60秒未満は除外（ショート等）
+                continue
 
-    base = "https://api.github.com"
-    headers = {"Accept": "application/vnd.github+json"}
-    # token は browser_download_url では不要だが、/releases 読み出しにはあってもOK
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+            views = det.get("viewCount", 0)
+            likes = det.get("likeCount", 0)
+            comments = det.get("commentCount", 0)
 
-    # 1) Release 情報取得
-    url_rel = f"{base}/repos/{repo}/releases/tags/{tag}"
-    r = requests.get(url_rel, headers=headers)
-    print(f"🔎 GET {url_rel} -> {r.status_code}")
-    if r.status_code != 200:
-        print("⚠️ Releaseが見つからないか、取得に失敗。既存は空として続行します。")
-        return dfs
-    rel = r.json()
+            try:
+                published_str = v.get("publishedAt", "")
+                # 'YYYY-MM-DDTHH:MM:SSZ' → 'YYYY/MM/DD HH:MM:SS'
+                published_fmt = (
+                    datetime.fromisoformat(published_str.rstrip("Z")).strftime("%Y/%m/%d %H:%M:%S")
+                    if published_str
+                    else ""
+                )
+            except Exception:
+                published_fmt = ""
 
-    # 2) 対象アセット探索
-    asset = next((a for a in rel.get("assets", []) if a.get("name") == asset_name), None)
-    if not asset:
-        print(f"⚠️ Releaseに {asset_name} が存在しません。既存は空として続行します。")
-        return dfs
+            new_records.append(
+                {
+                    "チャンネル名": channel_name,
+                    "タイトル": v.get("title", "タイトルなし"),
+                    "投稿日": published_fmt,
+                    "動画ID": vid,
+                    "再生時間": format_duration(dur),
+                    "再生数": int(views or 0),
+                    "コメント数": int(comments or 0),
+                    "イイネ数": int(likes or 0),
+                    "エンゲージメント係数": calculate_engagement(views, likes, comments),
+                    "URL": f"https://www.youtube.com/watch?v={vid}",
+                }
+            )
 
-    # 3) ダウンロードは browser_download_url を使用（認証不要で安定）
-    dl_url = asset.get("browser_download_url")
-    if not dl_url:
-        print("⚠️ browser_download_url が見つかりません。既存は空として続行します。")
-        return dfs
-
-    dr = requests.get(dl_url)
-    print(f"⬇️  Download {dl_url} -> {dr.status_code}, {len(dr.content)} bytes")
-    if dr.status_code != 200:
-        print("⚠️ 既存Excelのダウンロードに失敗。既存は空として続行します。")
-        return dfs
-
-    # 4) Excel 読み込み
-    with io.BytesIO(dr.content) as bio:
-        try:
-            book = pd.read_excel(bio, sheet_name=None)
-        except Exception as e:
-            print(f"⚠️ 既存Excelの読み込みに失敗: {e}")
-            return dfs
-
-    # 5) シートごとに整形して返す
-    for sn in SHEET_NAMES:
-        if sn in book:
-            df = book[sn]
-            # 欠けている列があれば補完（将来の列追加にも耐性）
-            for col in empty_cols:
-                if col not in df.columns:
-                    df[col] = ""
-            dfs[sn] = df[empty_cols].copy()
-
-    return dfs
-
-
-# ===== Excel保存（体裁調整つき） =====
-def save_book_with_format(dfs: dict[str, pd.DataFrame], path: str):
-    from openpyxl import Workbook
-    from openpyxl.utils import get_column_letter
-    from openpyxl.styles import Font, Alignment
-
-    wb = Workbook()
-    # 既定で作られる最初のシートを削除
-    default_ws = wb.active
-    wb.remove(default_ws)
-
-    for sheet_name, df in dfs.items():
-        ws = wb.create_sheet(title=sheet_name)
-        # ヘッダー
-        headers = ["タイトル", "URL", "投稿日", "引用元", "取得日時", "検索キーワード"]
-        ws.append(headers)
-        # データ
-        if not df.empty:
-            for row in df[headers].itertuples(index=False, name=None):
-                ws.append(list(row))
-
-        # オートフィルター
-        max_col = ws.max_column
-        max_row = ws.max_row
-        ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
-
-        # ヘッダー太字 & 縦中央
-        header_font = Font(bold=True)
-        for cell in ws[1]:
-            cell.font = header_font
-            cell.alignment = Alignment(vertical="center")
-
-        # 列幅（軽調整）
-        widths = {
-            "A": 50,  # タイトル
-            "B": 60,  # URL
-            "C": 16,  # 投稿日
-            "D": 24,  # 引用元
-            "E": 16,  # 取得日時
-            "F": 16,  # 検索キーワード
-        }
-        for col, wdt in widths.items():
-            if ws.max_column >= ord(col) - 64:
-                ws.column_dimensions[col].width = wdt
-
-        # 1行目固定
-        ws.freeze_panes = "A2"
-
-    # 出力
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    wb.save(path)
-
-
-# ===== メイン =====
-def main():
-    # キーワードは環境変数NEWS_KEYWORDSで上書き可能（例: "ホンダ,トヨタ,..."）
-    keywords = get_keywords()
-    print(f"🔎 キーワード一覧: {', '.join(keywords)}")
-
-    # 1) 既存ブック取得（固定Releaseから）
-    token = os.getenv("GITHUB_TOKEN", "")
-    repo = os.getenv("GITHUB_REPOSITORY", "")
-    dfs_old = download_existing_book(repo, RELEASE_TAG, ASSET_NAME, token)
-
-    # 2) 新規スクレイプ → シートごとにマージ（URLで重複排除、既存優先＝新規は末尾）
-    dfs_merged: dict[str, pd.DataFrame] = {}
-    for kw in keywords:
-        df_old = dfs_old.get(kw, pd.DataFrame(columns=["タイトル", "URL", "投稿日", "引用元", "取得日時", "検索キーワード"]))
-        df_new = scrape_yahoo(kw)
-
-        df_all = pd.concat([df_old, df_new], ignore_index=True)
-        if not df_all.empty:
-            df_all = df_all.dropna(subset=["URL"]).drop_duplicates(subset=["URL"], keep="first")
-            # 並べ替えはしない：既存の並びを維持し、新規は末尾に付く
-        dfs_merged[kw] = df_all
-
-        print(f"  - {kw}: 既存 {len(df_old)} 件 + 新規 {len(df_new)} 件 → 合計 {len(df_all)} 件")
-
-    # 3) 保存（各シートに出力、ヘッダにフィルター／フリーズ等）
-    os.makedirs("output", exist_ok=True)
-    out_path = os.path.join("output", ASSET_NAME)
-    save_book_with_format(dfs_merged, out_path)
-
-    print(f"✅ Excel出力: {out_path}")
-    # 固定DLリンク（実リポジトリ名が分かれば整形）
-    if repo:
-        owner_repo = repo
+    if new_records:
+        df_new = pd.DataFrame(new_records)
+        append_to_excel_base_on_existing(EXCEL_FILE, df_new)
+        print(f"✅ 新規 {len(df_new)} 件を追記しました。")
     else:
-        owner_repo = "<OWNER>/<REPO>"
-    print(f"🔗 固定DL: https://github.com/{owner_repo}/releases/download/{RELEASE_TAG}/{ASSET_NAME}")
+        print("新しい動画は見つかりませんでした。")
 
 
 if __name__ == "__main__":
