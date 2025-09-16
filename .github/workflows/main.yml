@@ -1,42 +1,64 @@
-# .github/workflows/main.yml
-
 name: Fetch and Update YouTube Videos
 
+# このワークフローが実行されるトリガーを定義
 on:
+  # 手動での実行を可能にする
   workflow_dispatch:
+  # 1時間ごとに自動実行するスケジュールを設定（UTC時間）
+  # cron式 '0 */1 * * *' は、毎時0分に実行することを意味します。
+  # 日本時間（JST）では、毎日9時、10時、11時...に実行されます。
   schedule:
-    # UTC時間で1時間ごとに実行 (例: 毎日0時,1時,2時...に実行)
-    # 日本時間(JST)では、毎日9時,10時,11時...に相当
     - cron: '0 */1 * * *'
 
+# 実行するジョブ（一連のタスク）を定義
 jobs:
   update-videos:
+    # ジョブが実行されるOS環境を指定
     runs-on: ubuntu-latest
     
+    # ジョブ内で実行されるステップを定義
     steps:
       - name: Checkout repository
+        # リポジトリのコードをランナーにチェックアウト（取得）
         uses: actions/checkout@v3
 
       - name: Set up Python
+        # Python環境をセットアップ
         uses: actions/setup-python@v4
         with:
+          # 使用するPythonのバージョンを指定
           python-version: '3.10'
           
       - name: Install dependencies
+        # Pythonの依存ライブラリをインストール
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests openpyxl
           
       - name: Run Python script
+        # 環境変数としてYouTube APIキーを渡し、Pythonスクリプトを実行
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           python main.py
           
-      - name: Commit and push changes
-        run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add youtube_videos.xlsx
-          git commit -m "chore: Add new YouTube videos [skip ci]" || echo "No changes to commit"
-          git push
+      - name: Create or update a release
+        # 実行結果をGitHubのリリースとして公開するための外部アクションを使用
+        uses: softprops/action-gh-release@v1
+        # 前のステップが成功した場合のみ実行
+        if: success()
+        env:
+          # リポジトリへの書き込み権限を持つトークンを渡す
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # リリースに付けるタグ名。この名前が同じだと既存のリリースが更新される
+          tag_name: youtube-videos-release
+          # リリースのタイトルを動的に設定
+          name: YouTube Videos (${{ github.run_id }})
+          # リリースに添付するファイルを指定
+          files: |
+            youtube_videos.xlsx
+          # リリースの説明文
+          body: |
+            新しい動画情報を追記したExcelファイルです。
+            最終更新日時: ${{ steps.commit-push.outputs.commit-date }}
