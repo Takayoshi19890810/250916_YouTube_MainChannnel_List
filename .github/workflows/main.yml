@@ -1,3 +1,5 @@
+# .github/workflows/main.yml
+
 name: Fetch and Update YouTube Videos
 
 # このワークフローが実行されるトリガーを定義
@@ -16,6 +18,10 @@ jobs:
     # ジョブが実行されるOS環境を指定
     runs-on: ubuntu-latest
     
+    # ワークフローにリポジトリへの書き込み権限を明示的に付与
+    permissions:
+      contents: write
+
     # ジョブ内で実行されるステップを定義
     steps:
       - name: Checkout repository
@@ -56,9 +62,8 @@ jobs:
           # リリースのタイトルを動的に設定
           name: YouTube Videos (${{ github.run_id }})
           # リリースに添付するファイルを指定
-          files: |
-            youtube_videos.xlsx
+          files: youtube_videos.xlsx
           # リリースの説明文
           body: |
             新しい動画情報を追記したExcelファイルです。
-            最終更新日時: ${{ steps.commit-push.outputs.commit-date }}
+            最終更新日時: ${{ github.run_id }}
