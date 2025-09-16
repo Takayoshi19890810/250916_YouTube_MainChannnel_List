@@ -11,9 +11,14 @@ API_KEY = os.environ.get('YOUTUBE_API_KEY')
 
 # ここに監視したいチャンネルの「チャンネル名」と「チャンネルID」を追加してください。
 CHANNEL_DATA = [
-    ['Google Developers', 'UC_x5XG1OV2P6uZZ5FSM9Ttw'],
-    ['TED', 'UCAu-c5gD5yGk2VlVz-cM3Fw'],
-    # 実際に追加したいチャンネルのデータをここに記述
+    ['ワンソクTube', 'UCo150kMjyLQDsLdudoyCqYg'],
+    ['e-Carlife', 'UCacmUS5IWcTzpI3b4ZkkSgw'],
+    ['Lavecars TV', 'UCtLo4nwb3ObCDZ4m8b8u7fA'],
+    ['Driver channel', 'UCup9EloQKxgDKvgJeKKZ85Q'],
+    ['ベストカーweb', 'UC7yk5_U7C0TuvYMqWzKyzkQ'],
+    ['Ride now', 'UC0P8fXzj-JxUsvDFEbpAkSg'],
+    ['Kozzi TV', 'UCaN_F80VfpD-vKn3IF4IQ'],
+    ['StartYourEnginesX', 'UCtCEcRRux8y03FOTGg621eA'],
 ]
 
 EXCEL_FILE = 'youtube_videos.xlsx'
