@@ -180,13 +180,17 @@ def main():
         df_new = pd.DataFrame(new_rows)
         # 新しい動画を既存のデータフレームの先頭に追加
         df_videos = pd.concat([df_new, df_videos], ignore_index=True)
-        try:
-            df_videos.to_excel(EXCEL_FILE, index=False)
-            print(f"{len(new_rows)}件の新しい動画をExcelファイルに追記しました。")
-        except Exception as e:
-            print(f"Excelファイルへの書き込み中にエラーが発生しました: {e}")
+        print(f"{len(new_rows)}件の新しい動画をExcelファイルに追記しました。")
     else:
         print("新しい動画は見つかりませんでした。")
+    
+    # 既存データと新規データを結合した最終的なDataFrameをExcelとして保存
+    try:
+        df_videos.to_excel(EXCEL_FILE, index=False)
+        print(f"Excelファイル '{EXCEL_FILE}' を保存しました。")
+    except Exception as e:
+        print(f"Excelファイルへの書き込み中にエラーが発生しました: {e}")
+
 
 if __name__ == '__main__':
     main()
