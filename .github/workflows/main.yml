@@ -1,21 +1,20 @@
-name: YouTube fetch hourly
+name: YouTube fetch hourly (Release)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # JSTでも毎時00分に起動（GitHubはUTCなので±0でOK）
+    - cron: "0 * * * *"   # 毎時00分（UTC）。JSTでも毎時00分に走る
   workflow_dispatch:
 
 permissions:
-  contents: write   # 自動コミットに必要
+  contents: write   # リリース作成・更新に必要
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0    # 念のため完全履歴（なくても可）
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,14 +26,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 直前のリリース資産 (youtube_videos.xlsx) をローカルへ取得
+      # 初回などリリースが無い場合はスキップされる
+      - name: Download latest release asset
+        uses: dawidd6/action-download-release@v2
+        with:
+          tag: youtube-videos-latest
+          file: youtube_videos.xlsx
+          skip_if_no_release: true
+
       - name: Run Python script
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           python main.py
 
-      - name: Commit & push updated Excel
-        uses: stefanzweifel/git-auto-commit-action@v5
+      # 更新済みの youtube_videos.xlsx を同じタグのリリースへ上書き添付
+      - name: Upload release asset
+        uses: svenstaro/upload-release-action@v2
         with:
-          commit_message: "chore: update youtube_videos.xlsx (auto)"
-          file_pattern: youtube_videos.xlsx
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: youtube-videos-latest
+          release_name: "YouTube Videos (latest)"
+          file: youtube_videos.xlsx
+          overwrite: true
+          body: "Hourly update: run ${{ github.run_id }} at $(date -u +'%Y-%m-%d %H:%M:%SZ')"
