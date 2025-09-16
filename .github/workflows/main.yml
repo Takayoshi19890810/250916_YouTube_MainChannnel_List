@@ -1,62 +1,58 @@
-name: Build & Release Yahoo News (latest, single file)
+name: YouTube fetch hourly (Release)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "0 * * * *"  # 毎時00分（UTC）= JSTでも毎時00分に実行
+    - cron: "0 * * * *"   # 毎時00分（UTC）。JSTでも毎時00分に走る
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # リリース作成・更新に必要
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Show Chrome path
-        id: chrome
-        run: echo "CHROME_PATH=$(which chrome)" >> $GITHUB_OUTPUT
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper (append to single Excel)
+      # 直前のリリース資産 (youtube_videos.xlsx) をローカルへ取得
+      # 初回などリリースが無い場合はスキップ
+      - name: Download latest release asset (if exists)
         env:
-          # 複数キーワードは NEWS_KEYWORDS に "ホンダ,トヨタ,マツダ,スバル,ダイハツ,スズキ,三菱自動車"
-          NEWS_KEYWORDS: ${{ vars.NEWS_KEYWORDS }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CHROME_PATH: ${{ steps.chrome.outputs.CHROME_PATH }}
-        run: python main.py
-
-      - name: List outputs (debug)
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh CLI 用トークン
         run: |
-          pwd
-          ls -la
-          ls -la output || true
+          if gh release view youtube-videos-latest >/dev/null 2>&1; then
+            echo "Found release 'youtube-videos-latest'. Downloading asset..."
+            gh release download youtube-videos-latest -p "youtube_videos.xlsx" -D .
+            ls -l youtube_videos.xlsx || true
+          else
+            echo "No existing release 'youtube-videos-latest'. Skipping download."
+          fi
 
-      - name: Upload to fixed Release (overwrite)
+      - name: Run Python script
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          python main.py
+
+      # 更新済みの youtube_videos.xlsx を同じタグのリリースへ上書き添付
+      - name: Upload release asset
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: news-latest
-          release_name: "Yahoo News (latest)"
-          file: output/yahoo_news.xlsx
-          asset_name: yahoo_news.xlsx
+          tag: youtube-videos-latest
+          release_name: "YouTube Videos (latest)"
+          file: youtube_videos.xlsx
           overwrite: true
-          body: "Single persistent Excel file. Appends new rows to each keyword sheet (dedup by URL, keep=first). AutoFilter enabled on header."
+          body: "Hourly update: run ${{ github.run_id }} at $(date -u +'%Y-%m-%d %H:%M:%SZ')"
