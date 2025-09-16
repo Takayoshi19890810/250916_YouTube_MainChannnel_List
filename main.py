@@ -1,214 +1,315 @@
 # main.py
 
 import os
+import re
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-import re
+from pathlib import Path
 
-# GitHub ActionsのSecretsからAPIキーを取得
-API_KEY = os.environ.get('YOUTUBE_API_KEY')
+# ==== 設定 ====
+API_KEY = os.environ.get("YOUTUBE_API_KEY")  # GitHub Actions Secrets から供給
+EXCEL_FILE = "youtube_videos.xlsx"
+YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/"
 
-# ここに監視したいチャンネルの「チャンネル名」と「チャンネルID」を追加してください。
+# 監視対象チャンネル（名前, チャンネルID）
 CHANNEL_DATA = [
-    ['ワンソクTube', 'UCo150kMjyLQDsLdudoyCqYg'],
-    ['e-Carlife', 'UCacmUS5IWcTzpI3b4ZkkSgw'],
-    ['Lavecars TV', 'UCtLo4nwb3ObCDZ4m8b8u7fA'],
-    ['Driver channel', 'UCup9EloQKxgDKvgJeKKZ85Q'],
-    ['ベストカーweb', 'UC7yk5_U7C0TuvYMqWzKyzkQ'],
-    ['Ride now', 'UC0P8fXzj-JxUsvDFEbpAkSg'],
-    ['Kozzi TV', 'UCaN_F80VfpD-vKn3IF4IQ'],
-    ['StartYourEnginesX', 'UCtCEcRRux8y03FOTGg621eA'],
+    ["ワンソクTube", "UCo150kMjyLQDsLdudoyCqYg"],
+    ["e-Carlife", "UCacmUS5IWcTzpI3b4ZkkSgw"],
+    ["Lavecars TV", "UCtLo4nwb3ObCDZ4m8b8u7fA"],
+    ["Driver channel", "UCup9EloQKxgDKvgJeKKZ85Q"],
+    ["ベストカーweb", "UC7yk5_U7C0TuvYMqWzKyzkQ"],
+    ["Ride now", "UC0P8fXzj-JxUsvDFEbpAkSg"],
+    ["Kozzi TV", "UCaN_F80VfpD-vKn3IF4IQ"],
+    ["StartYourEnginesX", "UCtCEcRRux8y03FOTGg621eA"],
 ]
 
-EXCEL_FILE = 'youtube_videos.xlsx'
+# 取得対象期間（例：直近60日）
+CUTOFF_DAYS = 60
+# ショート等の除外（60秒未満は除外）
+MIN_DURATION_SEC = 60
 
-YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/'
 
-def get_uploads_playlist_id(channel_id):
-    """チャンネルIDからアップロード用プレイリストIDを取得する"""
+# ==== ユーティリティ ====
+def parse_iso_duration(iso_duration: str) -> int:
+    """ISO8601のPTxxHxxMxxSを秒に変換"""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_duration or "")
+    if not m:
+        return 0
+    h, mm, s = m.groups(default="0")
+    return int(h) * 3600 + int(mm) * 60 + int(s)
+
+
+def format_duration(seconds: int) -> str:
+    """秒→HH:MM:SS"""
+    h, s = divmod(int(seconds), 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def calculate_engagement(views, likes, comments) -> str:
+    """(いいね+コメント)/再生数 * 100 [%]"""
     try:
-        url = f'{YOUTUBE_API_URL}channels?part=contentDetails&id={channel_id}&key={API_KEY}'
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if 'items' not in data or not data['items']:
-            raise ValueError(f"チャンネルID '{channel_id}' の情報が取得できませんでした。")
-        return data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+        v = int(views)
+        l = int(likes)
+        c = int(comments)
+    except Exception:
+        return ""
+    if v <= 0:
+        return ""
+    return f"{((l + c) / v) * 100:.2f}%"
+
+
+# ==== YouTube Data API ====
+def get_uploads_playlist_id(channel_id: str) -> str | None:
+    """チャンネルID→uploadsプレイリストID"""
+    try:
+        resp = requests.get(
+            f"{YOUTUBE_API_URL}channels",
+            params={"part": "contentDetails", "id": channel_id, "key": API_KEY},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            print(f"❌ チャンネルID '{channel_id}' が見つかりません")
+            return None
+        return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
     except Exception as e:
-        print(f"❌ チャンネル情報の取得エラー: {e}")
+        print(f"❌ チャンネル情報取得エラー: {e}")
         return None
 
-def get_videos_from_playlist(playlist_id, cutoff_date):
-    """プレイリストから指定期間内の動画を取得する"""
-    videos = []
+
+def get_videos_from_playlist(playlist_id: str, cutoff_date: datetime) -> list[dict]:
+    """
+    uploadsプレイリストから動画の基礎情報を取得。
+    cutoff_date より古い動画に達したら打ち切る。
+    """
+    results: list[dict] = []
     if not playlist_id:
-        return videos
-        
-    page_token = ''
+        return results
+
+    page_token = None
     while True:
         try:
-            url = f'{YOUTUBE_API_URL}playlistItems?part=snippet&playlistId={playlist_id}&maxResults=50&pageToken={page_token}&key={API_KEY}'
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
+            params = {
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": 50,
+                "key": API_KEY,
+            }
+            if page_token:
+                params["pageToken"] = page_token
 
-            for item in data.get('items', []):
-                snippet = item.get('snippet')
-                if not snippet:
-                    continue
+            resp = requests.get(f"{YOUTUBE_API_URL}playlistItems", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
 
-                published_at_str = snippet.get('publishedAt')
+            for item in data.get("items", []):
+                snippet = item.get("snippet") or {}
+                published_at_str = snippet.get("publishedAt")
                 if not published_at_str:
                     continue
 
-                published_at = datetime.fromisoformat(published_at_str[:-1])
+                # 例: '2025-09-01T12:34:56Z' → datetime
+                published_at = datetime.fromisoformat(published_at_str.rstrip("Z"))
                 if published_at < cutoff_date:
-                    return videos
+                    # 以降は古いと仮定して打ち切り
+                    return results
 
-                videos.append({
-                    'title': snippet.get('title', "タイトルなし"),
-                    'videoId': snippet.get('resourceId', {}).get('videoId'),
-                    'publishedAt': published_at_str
-                })
+                results.append(
+                    {
+                        "title": snippet.get("title", "タイトルなし"),
+                        "videoId": (snippet.get("resourceId") or {}).get("videoId"),
+                        "publishedAt": published_at_str,  # ISO文字列のまま保持
+                    }
+                )
 
-            if 'nextPageToken' not in data:
+            page_token = data.get("nextPageToken")
+            if not page_token:
                 break
-            page_token = data['nextPageToken']
-        except Exception as e:
-            print(f"❌ プレイリスト動画の取得エラー: {e}")
-            break
-    return videos
 
-def get_video_details(video_ids):
-    """動画IDリストから詳細情報を取得する"""
-    details_map = {}
+        except Exception as e:
+            print(f"❌ プレイリスト取得エラー: {e}")
+            break
+
+    return results
+
+
+def get_video_details(video_ids: list[str]) -> dict[str, dict]:
+    """動画ID群→ {videoId: {viewCount, likeCount, commentCount, durationSeconds}}"""
+    details: dict[str, dict] = {}
     if not video_ids:
-        return details_map
+        return details
 
     for i in range(0, len(video_ids), 50):
+        ids_chunk = list(filter(None, video_ids[i : i + 50]))
+        if not ids_chunk:
+            continue
         try:
-            ids = ','.join(filter(None, video_ids[i:i+50]))
-            if not ids:
-                continue
-            
-            url = f'{YOUTUBE_API_URL}videos?part=statistics,contentDetails&id={ids}&key={API_KEY}'
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
+            resp = requests.get(
+                f"{YOUTUBE_API_URL}videos",
+                params={
+                    "part": "statistics,contentDetails",
+                    "id": ",".join(ids_chunk),
+                    "key": API_KEY,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-            for item in data.get('items', []):
-                video_id = item['id']
-                stats = item.get('statistics', {})
-                duration_iso = item.get('contentDetails', {}).get('duration', "PT0S")
-                
-                details_map[video_id] = {
-                    'viewCount': stats.get('viewCount', 0),
-                    'likeCount': stats.get('likeCount', 0),
-                    'commentCount': stats.get('commentCount', 0),
-                    'durationSeconds': parse_iso_duration(duration_iso)
+            for item in data.get("items", []):
+                vid = item.get("id")
+                stats = item.get("statistics", {}) or {}
+                dur_iso = (item.get("contentDetails", {}) or {}).get("duration", "PT0S")
+                details[vid] = {
+                    "viewCount": stats.get("viewCount", 0),
+                    "likeCount": stats.get("likeCount", 0),
+                    "commentCount": stats.get("commentCount", 0),
+                    "durationSeconds": parse_iso_duration(dur_iso),
                 }
         except Exception as e:
-            print(f"❌ 動画詳細の取得エラー: {e}")
-    return details_map
+            print(f"❌ 動画詳細取得エラー: {e}")
 
-# 以下、以前の関数とmain()関数は変更なし
+    return details
 
-def parse_iso_duration(iso_duration):
-    """ISO8601形式の再生時間を秒数に変換する"""
-    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
-    if not match:
-        return 0
-    h, m, s = match.groups(default='0')
-    return int(h) * 3600 + int(m) * 60 + int(s)
 
-def format_duration(seconds):
-    """秒数を HH:MM:SS 形式に変換する"""
-    h, s = divmod(seconds, 3600)
-    m, s = divmod(s, 60)
-    return f'{h:02d}:{m:02d}:{s:02d}'
+# ==== Excelの結合（既存ベースで新規だけ追記） ====
+def append_to_excel_base_on_existing(base_xlsx: str, new_rows: pd.DataFrame) -> None:
+    """
+    既存Excelの内容をベースに new_rows を追記し、動画IDで重複排除して保存。
+    公開日時があれば降順に並べ替え。
+    """
+    base_path = Path(base_xlsx)
 
-def calculate_engagement(views, likes, comments):
-    """エンゲージメント係数を計算する"""
-    views = int(views)
-    likes = int(likes)
-    comments = int(comments)
-    if views == 0:
-        return ''
-    engagement = ((likes + comments) / views) * 100
-    return f'{engagement:.2f}%'
+    if base_path.exists():
+        try:
+            base_df = pd.read_excel(base_path)
+        except Exception:
+            base_df = pd.DataFrame()
+    else:
+        base_df = pd.DataFrame()
 
+    # 列合わせ（欠けている列を補完）
+    for col in set(new_rows.columns) - set(base_df.columns):
+        base_df[col] = pd.NA
+    for col in set(base_df.columns) - set(new_rows.columns):
+        new_rows[col] = pd.NA
+
+    merged = pd.concat([new_rows, base_df], ignore_index=True)  # 新着を先頭に
+    if "動画ID" in merged.columns:
+        merged.drop_duplicates(subset=["動画ID"], keep="first", inplace=True)
+
+    # 公開日時の列候補
+    for cand in ["投稿日", "publishedAt", "publishTime", "published_at"]:
+        if cand in merged.columns:
+            merged[cand] = pd.to_datetime(merged[cand], errors="coerce")
+            merged.sort_values(cand, ascending=False, inplace=True)
+            break
+
+    merged.reset_index(drop=True, inplace=True)
+    merged.to_excel(base_path, index=False)
+
+
+# ==== メイン ====
 def main():
     if not API_KEY:
         print("エラー: YouTube APIキーが設定されていません。")
         return
 
+    # 既存Excelから既知の動画ID集合を作る（なければ空）
     try:
-        df_videos = pd.read_excel(EXCEL_FILE, index_col=None)
-        existing_video_ids = set(df_videos['動画ID'])
-        print(f"既存のExcelファイル '{EXCEL_FILE}' を読み込みました。")
+        df_existing = pd.read_excel(EXCEL_FILE)
+        known_ids = set(df_existing.get("動画ID", pd.Series(dtype=str)).dropna().astype(str).tolist())
+        print(f"既存Excel '{EXCEL_FILE}' を読み込みました。既知ID: {len(known_ids)}件")
     except FileNotFoundError:
-        df_videos = pd.DataFrame(columns=['チャンネル名', 'タイトル', '投稿日', '動画ID', '再生時間', '再生数', 'コメント数', 'イイネ数', 'エンゲージメント係数', 'URL'])
-        existing_video_ids = set()
-        print(f"'{EXCEL_FILE}' が見つからないため、新しいファイルを作成します。")
+        df_existing = pd.DataFrame(
+            columns=[
+                "チャンネル名",
+                "タイトル",
+                "投稿日",
+                "動画ID",
+                "再生時間",
+                "再生数",
+                "コメント数",
+                "イイネ数",
+                "エンゲージメント係数",
+                "URL",
+            ]
+        )
+        known_ids = set()
+        print(f"'{EXCEL_FILE}' が見つからないため、新規作成します。")
     except Exception as e:
-        print(f"Excelファイルの読み込み中に予期せぬエラーが発生しました: {e}")
+        print(f"Excel読み込みエラー: {e}")
         return
 
-    two_months_ago = datetime.now() - timedelta(days=60)
-    new_rows = []
+    cutoff = datetime.now() - timedelta(days=CUTOFF_DAYS)
+    new_records = []
 
     for channel_name, channel_id in CHANNEL_DATA:
         print(f"▶ 処理中: {channel_name} ({channel_id})")
-        try:
-            uploads_id = get_uploads_playlist_id(channel_id)
-            if not uploads_id:
+        uploads_id = get_uploads_playlist_id(channel_id)
+        if not uploads_id:
+            continue
+
+        videos = get_videos_from_playlist(uploads_id, cutoff)
+        if not videos:
+            print(f"チャンネル '{channel_name}' に新着はありません。")
+            continue
+
+        ids = [v["videoId"] for v in videos if v.get("videoId")]
+        details = get_video_details(ids)
+
+        for v in videos:
+            vid = v.get("videoId")
+            if not vid or vid in known_ids:
                 continue
 
-            videos = get_videos_from_playlist(uploads_id, two_months_ago)
-
-            if not videos:
-                print(f"チャンネル '{channel_name}' に新しい動画が見つかりませんでした。")
+            det = details.get(vid, {})
+            dur = int(det.get("durationSeconds") or 0)
+            if dur < MIN_DURATION_SEC:
+                # 60秒未満は除外（ショート等）
                 continue
 
-            ids = [v['videoId'] for v in videos]
-            details_map = get_video_details(ids)
+            views = det.get("viewCount", 0)
+            likes = det.get("likeCount", 0)
+            comments = det.get("commentCount", 0)
 
-            for v in videos:
-                if v['videoId'] in existing_video_ids:
-                    continue
+            try:
+                published_str = v.get("publishedAt", "")
+                # 'YYYY-MM-DDTHH:MM:SSZ' → 'YYYY/MM/DD HH:MM:SS'
+                published_fmt = (
+                    datetime.fromisoformat(published_str.rstrip("Z")).strftime("%Y/%m/%d %H:%M:%S")
+                    if published_str
+                    else ""
+                )
+            except Exception:
+                published_fmt = ""
 
-                d = details_map.get(v['videoId'])
-                if not d or d['durationSeconds'] < 60:
-                    continue
+            new_records.append(
+                {
+                    "チャンネル名": channel_name,
+                    "タイトル": v.get("title", "タイトルなし"),
+                    "投稿日": published_fmt,
+                    "動画ID": vid,
+                    "再生時間": format_duration(dur),
+                    "再生数": int(views or 0),
+                    "コメント数": int(comments or 0),
+                    "イイネ数": int(likes or 0),
+                    "エンゲージメント係数": calculate_engagement(views, likes, comments),
+                    "URL": f"https://www.youtube.com/watch?v={vid}",
+                }
+            )
 
-                new_rows.append({
-                    'チャンネル名': channel_name,
-                    'タイトル': v['title'],
-                    '投稿日': datetime.fromisoformat(v['publishedAt'][:-1]).strftime('%Y/%m/%d %H:%M:%S'),
-                    '動画ID': v['videoId'],
-                    '再生時間': format_duration(d['durationSeconds']),
-                    '再生数': int(d['viewCount']),
-                    'コメント数': int(d['commentCount']),
-                    'イイネ数': int(d['likeCount']),
-                    'エンゲージメント係数': calculate_engagement(d['viewCount'], d['likeCount'], d['commentCount']),
-                    'URL': f'https://www.youtube.com/watch?v={v["videoId"]}'
-                })
-        except requests.exceptions.HTTPError as err:
-            print(f"❌ API通信エラー [チャンネルID:{channel_id}]: {err}")
-        except Exception as e:
-            print(f"❌ 予期せぬエラー [チャンネルID:{channel_id}]: {e}")
-
-    if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        df_videos = pd.concat([df_new, df_videos], ignore_index=True)
-        try:
-            df_videos.to_excel(EXCEL_FILE, index=False)
-            print(f"{len(new_rows)}件の新しい動画をExcelファイルに追記しました。")
-        except Exception as e:
-            print(f"Excelファイルへの書き込み中にエラーが発生しました: {e}")
+    if new_records:
+        df_new = pd.DataFrame(new_records)
+        append_to_excel_base_on_existing(EXCEL_FILE, df_new)
+        print(f"✅ 新規 {len(df_new)} 件を追記しました。")
     else:
         print("新しい動画は見つかりませんでした。")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
