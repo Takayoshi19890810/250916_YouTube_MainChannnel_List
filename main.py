@@ -10,11 +10,11 @@ import re
 API_KEY = os.environ.get('YOUTUBE_API_KEY')
 
 # スプレッドシートの代わりに、チャンネル情報をスクリプト内に定義
-# 実際の使用時は、この部分をExcelファイルから読み込むように変更することも可能です。
+# ここに監視したいチャンネルの「チャンネル名」と「チャンネルID」を追加してください。
 CHANNEL_DATA = [
     ['チャンネル名1', 'UCMuY6dM9l0c3o-C4R5pU3pQ'],
     ['チャンネル名2', 'UCg0s8PjYmD7U5R8tYQ1K5wA'],
-    # チャンネル名とチャンネルIDを追加してください
+    # 例：['Google Developers', 'UC_x5XG1OV2P6uZZ5FSM9Ttw'],
 ]
 
 EXCEL_FILE = 'youtube_videos.xlsx'
@@ -28,6 +28,8 @@ def get_uploads_playlist_id(channel_id):
     response = requests.get(url)
     response.raise_for_status()
     data = response.json()
+    if 'items' not in data or not data['items']:
+        raise ValueError(f"チャンネルID '{channel_id}' が見つかりません。")
     return data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
 def get_videos_from_playlist(playlist_id, cutoff_date):
@@ -40,7 +42,7 @@ def get_videos_from_playlist(playlist_id, cutoff_date):
         response.raise_for_status()
         data = response.json()
 
-        for item in data['items']:
+        for item in data.get('items', []):
             published_at = datetime.fromisoformat(item['snippet']['publishedAt'][:-1])
             if published_at < cutoff_date:
                 return videos
@@ -65,10 +67,10 @@ def get_video_details(video_ids):
         response.raise_for_status()
         data = response.json()
 
-        for item in data['items']:
+        for item in data.get('items', []):
             video_id = item['id']
             stats = item.get('statistics', {})
-            duration_iso = item['contentDetails']['duration']
+            duration_iso = item.get('contentDetails', {}).get('duration', "PT0S")
             
             details_map[video_id] = {
                 'viewCount': stats.get('viewCount', 0),
@@ -104,20 +106,23 @@ def calculate_engagement(views, likes, comments):
 
 def main():
     if not API_KEY:
-        print("APIキーが設定されていません。GitHub ActionsのSecretsにYOUTUBE_API_KEYを設定してください。")
+        print("エラー: YouTube APIキーが設定されていません。")
         return
 
-    # 既存のExcelファイルがあれば読み込む
+    # 既存のExcelファイルがあれば読み込み、なければ空のDataFrameを作成
     try:
         df_videos = pd.read_excel(EXCEL_FILE, index_col=None)
         existing_video_ids = set(df_videos['動画ID'])
+        print(f"既存のExcelファイル '{EXCEL_FILE}' を読み込みました。")
     except FileNotFoundError:
         df_videos = pd.DataFrame(columns=['チャンネル名', 'タイトル', '投稿日', '動画ID', '再生時間', '再生数', 'コメント数', 'イイネ数', 'エンゲージメント係数', 'URL'])
         existing_video_ids = set()
+        print(f"'{EXCEL_FILE}' が見つからないため、新しいファイルを作成します。")
     except Exception as e:
-        print(f"Excelファイルの読み込み中にエラーが発生しました: {e}")
+        print(f"Excelファイルの読み込み中に予期せぬエラーが発生しました: {e}")
         return
 
+    # 過去2ヶ月間の動画を対象とする
     two_months_ago = datetime.now() - timedelta(days=60)
     new_rows = []
 
@@ -128,7 +133,7 @@ def main():
             videos = get_videos_from_playlist(uploads_id, two_months_ago)
 
             if not videos:
-                print("新しい動画が見つかりませんでした。")
+                print(f"チャンネル '{channel_name}' に新しい動画が見つかりませんでした。")
                 continue
 
             ids = [v['videoId'] for v in videos]
@@ -148,23 +153,28 @@ def main():
                     '投稿日': datetime.fromisoformat(v['publishedAt'][:-1]).strftime('%Y/%m/%d %H:%M:%S'),
                     '動画ID': v['videoId'],
                     '再生時間': format_duration(d['durationSeconds']),
-                    '再生数': d['viewCount'],
-                    'コメント数': d['commentCount'],
-                    'イイネ数': d['likeCount'],
+                    '再生数': int(d['viewCount']),
+                    'コメント数': int(d['commentCount']),
+                    'イイネ数': int(d['likeCount']),
                     'エンゲージメント係数': calculate_engagement(d['viewCount'], d['likeCount'], d['commentCount']),
                     'URL': f'https://www.youtube.com/watch?v={v["videoId"]}'
                 })
+        except requests.exceptions.HTTPError as err:
+            print(f"❌ API通信エラー [チャンネルID:{channel_id}]: {err}")
         except Exception as e:
-            print(f"❌ エラー [${channel_id}]: {e}")
+            print(f"❌ 予期せぬエラー [チャンネルID:{channel_id}]: {e}")
 
     if new_rows:
         df_new = pd.DataFrame(new_rows)
+        # 新しい動画を既存のデータフレームの先頭に追加
         df_videos = pd.concat([df_new, df_videos], ignore_index=True)
         try:
             df_videos.to_excel(EXCEL_FILE, index=False)
             print(f"{len(new_rows)}件の新しい動画をExcelファイルに追記しました。")
         except Exception as e:
             print(f"Excelファイルへの書き込み中にエラーが発生しました: {e}")
+    else:
+        print("新しい動画は見つかりませんでした。")
 
 if __name__ == '__main__':
     main()
