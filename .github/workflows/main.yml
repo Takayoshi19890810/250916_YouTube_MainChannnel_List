@@ -1,69 +1,40 @@
-# .github/workflows/main.yml
+name: YouTube fetch hourly
 
-name: Fetch and Update YouTube Videos
-
-# このワークフローが実行されるトリガーを定義
 on:
-  # 手動での実行を可能にする
-  workflow_dispatch:
-  # 1時間ごとに自動実行するスケジュールを設定（UTC時間）
-  # cron式 '0 */1 * * *' は、毎時0分に実行することを意味します。
-  # 日本時間（JST）では、毎日9時、10時、11時...に実行されます。
   schedule:
-    - cron: '0 */1 * * *'
+    - cron: "0 * * * *"   # JSTでも毎時00分に起動（GitHubはUTCなので±0でOK）
+  workflow_dispatch:
 
-# 実行するジョブ（一連のタスク）を定義
+permissions:
+  contents: write   # 自動コミットに必要
+
 jobs:
-  update-videos:
-    # ジョブが実行されるOS環境を指定
+  run:
     runs-on: ubuntu-latest
-    
-    # ワークフローにリポジトリへの書き込み権限を明示的に付与
-    permissions:
-      contents: write
-
-    # ジョブ内で実行されるステップを定義
     steps:
-      - name: Checkout repository
-        # リポジトリのコードをランナーにチェックアウト（取得）
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 念のため完全履歴（なくても可）
 
       - name: Set up Python
-        # Python環境をセットアップ
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          # 使用するPythonのバージョンを指定
-          python-version: '3.10'
-          
-      - name: Install dependencies
-        # Pythonの依存ライブラリをインストール
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests openpyxl
-          
+          pip install -r requirements.txt
+
       - name: Run Python script
-        # 環境変数としてYouTube APIキーを渡し、Pythonスクリプトを実行
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           python main.py
-          
-      - name: Create or update a release
-        # 実行結果をGitHubのリリースとして公開するための外部アクションを使用
-        uses: softprops/action-gh-release@v1
-        # 前のステップが成功した場合のみ実行
-        if: success()
-        env:
-          # リポジトリへの書き込み権限を持つトークンを渡す
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit & push updated Excel
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          # リリースに付けるタグ名。この名前が同じだと既存のリリースが更新される
-          tag_name: youtube-videos-release
-          # リリースのタイトルを動的に設定
-          name: YouTube Videos (${{ github.run_id }})
-          # リリースに添付するファイルを指定
-          files: youtube_videos.xlsx
-          # リリースの説明文
-          body: |
-            新しい動画情報を追記したExcelファイルです。
-            最終更新日時: ${{ github.run_id }}
+          commit_message: "chore: update youtube_videos.xlsx (auto)"
+          file_pattern: youtube_videos.xlsx
