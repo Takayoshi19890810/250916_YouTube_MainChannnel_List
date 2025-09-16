@@ -9,17 +9,15 @@ import re
 # GitHub ActionsのSecretsからAPIキーを取得
 API_KEY = os.environ.get('YOUTUBE_API_KEY')
 
-# スプレッドシートの代わりに、チャンネル情報をスクリプト内に定義
 # ここに監視したいチャンネルの「チャンネル名」と「チャンネルID」を追加してください。
 CHANNEL_DATA = [
-    ['チャンネル名1', 'UCMuY6dM9l0c3o-C4R5pU3pQ'],
-    ['チャンネル名2', 'UCg0s8PjYmD7U5R8tYQ1K5wA'],
-    # 例：['Google Developers', 'UC_x5XG1OV2P6uZZ5FSM9Ttw'],
+    ['Google Developers', 'UC_x5XG1OV2P6uZZ5FSM9Ttw'],
+    ['TED', 'UCAu-c5gD5yGk2VlVz-cM3Fw'],
+    # 実際に追加したいチャンネルのデータをここに記述
 ]
 
 EXCEL_FILE = 'youtube_videos.xlsx'
 
-# YouTube Data APIのベースURL
 YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/'
 
 def get_uploads_playlist_id(channel_id):
