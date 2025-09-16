@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
+import pytz # 追加
 
 # ==== 設定 ====
 API_KEY = os.environ.get("YOUTUBE_API_KEY")  # GitHub Actions Secrets から供給
@@ -16,7 +17,7 @@ YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/"
 CHANNEL_DATA = [
     ["ワンソクTube", "UCo150kMjyLQDsLdudoyCqYg"],
     ["e-Carlife", "UCacmUS5IWcTzpI3b4ZkkSgw"],
-    ["Lavecars TV", "UCtLo4nwb3ObCDZ4m8b8u7fA"],
+    ["Lavecars TV", "UCtLo4mwb3ObCDZ4m8b8u7fA"],
     ["Driver channel", "UCup9EloQKxgDKvgJeKKZ85Q"],
     ["ベストカーweb", "UC7yk5_U7C0TuvYMqWzKyzkQ"],
     ["Ride now", "UC0P8fXzj-JxUsvDFEbpAkSg"],
@@ -279,11 +280,13 @@ def main():
             try:
                 published_str = v.get("publishedAt", "")
                 # 'YYYY-MM-DDTHH:MM:SSZ' → 'YYYY/MM/DD HH:MM:SS'
-                published_fmt = (
-                    datetime.fromisoformat(published_str.rstrip("Z")).strftime("%Y/%m/%d %H:%M:%S")
-                    if published_str
-                    else ""
-                )
+                # タイムゾーン情報を追加し、JSTに変換
+                if published_str:
+                    utc_dt = datetime.fromisoformat(published_str.rstrip("Z")).replace(tzinfo=pytz.utc)
+                    jst_dt = utc_dt.astimezone(pytz.timezone('Asia/Tokyo'))
+                    published_fmt = jst_dt.strftime("%Y/%m/%d %H:%M:%S")
+                else:
+                    published_fmt = ""
             except Exception:
                 published_fmt = ""
 
