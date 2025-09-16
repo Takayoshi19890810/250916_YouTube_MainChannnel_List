@@ -22,61 +22,92 @@ YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/'
 
 def get_uploads_playlist_id(channel_id):
     """チャンネルIDからアップロード用プレイリストIDを取得する"""
-    url = f'{YOUTUBE_API_URL}channels?part=contentDetails&id={channel_id}&key={API_KEY}'
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-    if 'items' not in data or not data['items']:
-        raise ValueError(f"チャンネルID '{channel_id}' が見つかりません。")
-    return data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    try:
+        url = f'{YOUTUBE_API_URL}channels?part=contentDetails&id={channel_id}&key={API_KEY}'
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        if 'items' not in data or not data['items']:
+            raise ValueError(f"チャンネルID '{channel_id}' の情報が取得できませんでした。")
+        return data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    except Exception as e:
+        print(f"❌ チャンネル情報の取得エラー: {e}")
+        return None
 
 def get_videos_from_playlist(playlist_id, cutoff_date):
     """プレイリストから指定期間内の動画を取得する"""
     videos = []
+    if not playlist_id:
+        return videos
+        
     page_token = ''
     while True:
-        url = f'{YOUTUBE_API_URL}playlistItems?part=snippet&playlistId={playlist_id}&maxResults=50&pageToken={page_token}&key={API_KEY}'
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            url = f'{YOUTUBE_API_URL}playlistItems?part=snippet&playlistId={playlist_id}&maxResults=50&pageToken={page_token}&key={API_KEY}'
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
 
-        for item in data.get('items', []):
-            published_at = datetime.fromisoformat(item['snippet']['publishedAt'][:-1])
-            if published_at < cutoff_date:
-                return videos
-            videos.append({
-                'title': item['snippet']['title'],
-                'videoId': item['snippet']['resourceId']['videoId'],
-                'publishedAt': item['snippet']['publishedAt']
-            })
+            for item in data.get('items', []):
+                snippet = item.get('snippet')
+                if not snippet:
+                    continue
 
-        if 'nextPageToken' not in data:
+                published_at_str = snippet.get('publishedAt')
+                if not published_at_str:
+                    continue
+
+                published_at = datetime.fromisoformat(published_at_str[:-1])
+                if published_at < cutoff_date:
+                    return videos
+
+                videos.append({
+                    'title': snippet.get('title', "タイトルなし"),
+                    'videoId': snippet.get('resourceId', {}).get('videoId'),
+                    'publishedAt': published_at_str
+                })
+
+            if 'nextPageToken' not in data:
+                break
+            page_token = data['nextPageToken']
+        except Exception as e:
+            print(f"❌ プレイリスト動画の取得エラー: {e}")
             break
-        page_token = data['nextPageToken']
     return videos
 
 def get_video_details(video_ids):
     """動画IDリストから詳細情報を取得する"""
     details_map = {}
-    for i in range(0, len(video_ids), 50):
-        ids = ','.join(video_ids[i:i+50])
-        url = f'{YOUTUBE_API_URL}videos?part=statistics,contentDetails&id={ids}&key={API_KEY}'
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
+    if not video_ids:
+        return details_map
 
-        for item in data.get('items', []):
-            video_id = item['id']
-            stats = item.get('statistics', {})
-            duration_iso = item.get('contentDetails', {}).get('duration', "PT0S")
+    for i in range(0, len(video_ids), 50):
+        try:
+            ids = ','.join(filter(None, video_ids[i:i+50]))
+            if not ids:
+                continue
             
-            details_map[video_id] = {
-                'viewCount': stats.get('viewCount', 0),
-                'likeCount': stats.get('likeCount', 0),
-                'commentCount': stats.get('commentCount', 0),
-                'durationSeconds': parse_iso_duration(duration_iso)
-            }
+            url = f'{YOUTUBE_API_URL}videos?part=statistics,contentDetails&id={ids}&key={API_KEY}'
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            for item in data.get('items', []):
+                video_id = item['id']
+                stats = item.get('statistics', {})
+                duration_iso = item.get('contentDetails', {}).get('duration', "PT0S")
+                
+                details_map[video_id] = {
+                    'viewCount': stats.get('viewCount', 0),
+                    'likeCount': stats.get('likeCount', 0),
+                    'commentCount': stats.get('commentCount', 0),
+                    'durationSeconds': parse_iso_duration(duration_iso)
+                }
+        except Exception as e:
+            print(f"❌ 動画詳細の取得エラー: {e}")
     return details_map
+
+# 以下、以前の関数とmain()関数は変更なし
 
 def parse_iso_duration(iso_duration):
     """ISO8601形式の再生時間を秒数に変換する"""
@@ -107,7 +138,6 @@ def main():
         print("エラー: YouTube APIキーが設定されていません。")
         return
 
-    # 既存のExcelファイルがあれば読み込み、なければ空のDataFrameを作成
     try:
         df_videos = pd.read_excel(EXCEL_FILE, index_col=None)
         existing_video_ids = set(df_videos['動画ID'])
@@ -120,7 +150,6 @@ def main():
         print(f"Excelファイルの読み込み中に予期せぬエラーが発生しました: {e}")
         return
 
-    # 過去2ヶ月間の動画を対象とする
     two_months_ago = datetime.now() - timedelta(days=60)
     new_rows = []
 
@@ -128,6 +157,9 @@ def main():
         print(f"▶ 処理中: {channel_name} ({channel_id})")
         try:
             uploads_id = get_uploads_playlist_id(channel_id)
+            if not uploads_id:
+                continue
+
             videos = get_videos_from_playlist(uploads_id, two_months_ago)
 
             if not videos:
@@ -164,7 +196,6 @@ def main():
 
     if new_rows:
         df_new = pd.DataFrame(new_rows)
-        # 新しい動画を既存のデータフレームの先頭に追加
         df_videos = pd.concat([df_new, df_videos], ignore_index=True)
         try:
             df_videos.to_excel(EXCEL_FILE, index=False)
