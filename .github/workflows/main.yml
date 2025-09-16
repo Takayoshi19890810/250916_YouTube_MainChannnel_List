@@ -27,13 +27,18 @@ jobs:
           pip install -r requirements.txt
 
       # 直前のリリース資産 (youtube_videos.xlsx) をローカルへ取得
-      # 初回などリリースが無い場合はスキップされる
-      - name: Download latest release asset
-        uses: dawidd6/action-download-release@v2
-        with:
-          tag: youtube-videos-latest
-          file: youtube_videos.xlsx
-          skip_if_no_release: true
+      # 初回などリリースが無い場合はスキップ
+      - name: Download latest release asset (if exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh CLI 用トークン
+        run: |
+          if gh release view youtube-videos-latest >/dev/null 2>&1; then
+            echo "Found release 'youtube-videos-latest'. Downloading asset..."
+            gh release download youtube-videos-latest -p "youtube_videos.xlsx" -D .
+            ls -l youtube_videos.xlsx || true
+          else
+            echo "No existing release 'youtube-videos-latest'. Skipping download."
+          fi
 
       - name: Run Python script
         env:
